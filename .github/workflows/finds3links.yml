@@ -1,18 +1,18 @@
-name: Find S3 Links
+name: FindS3Links
 
 on:
   workflow_dispatch:
     inputs:
-      subdomain:
-        description: "Subdomínio de partida (ex.: app.example.com)"
+      domain:
+        description: "Domínio base (ex.: example.com) — sem http/https"
         required: true
-        default: "app.example.com"
+        default: "example.com"
       max_pages:
-        description: "Máximo de páginas a visitar (mesmo host)"
+        description: "Máximo de páginas por host (crawl controlado)"
         required: false
-        default: "12"
+        default: "10"
       timeout_sec:
-        description: "Timeout (segundos) por requisição HTTP"
+        description: "Timeout (s) por requisição HTTP"
         required: false
         default: "8"
 
@@ -20,85 +20,191 @@ permissions:
   contents: read
 
 jobs:
-  find-s3:
+  discover:
     runs-on: ubuntu-latest
     outputs:
       s3_url: ${{ steps.test.outputs.s3_url }}
     steps:
-      - name: Prep
+      - name: Preparar ambiente
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y curl jq || true
           mkdir -p artifacts
-          : > artifacts/queue.txt
-          : > artifacts/visited.txt
+          : > artifacts/seed_urls.txt
           : > artifacts/subdomains.txt
+          : > artifacts/visited.txt
+          : > artifacts/queue.txt
           : > artifacts/s3_candidates.txt
-          echo "[]" > artifacts/results.json
           : > artifacts/s3_found.txt
+          echo "[]" > artifacts/results.json
 
-      - name: Crawl (same host) + extrair S3
+      - name: Validar formato do domínio (seguro)
+        id: validate
+        shell: bash
+        env:
+          DOMAIN: ${{ inputs.domain }}
+        run: |
+          set -euo pipefail
+          # Permite letras, números, hífen e pontos. Tamanho máx. 253. Não permite http/https, barras ou espaços.
+          if ! [[ "$DOMAIN" =~ ^([a-z0-9]([-a-z0-9]*[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+            echo "❌ Domínio inválido: '$DOMAIN'. Use algo como 'example.com'."
+            exit 1
+          fi
+          echo "✅ Domínio aceito: $DOMAIN"
+
+      - name: Resolver DNS e checar alcance HTTP
+        id: dnscheck
+        shell: bash
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          TOUT: ${{ inputs.timeout_sec }}
+        run: |
+          set -euo pipefail
+          echo "🔍 Resolvendo DNS para: $DOMAIN"
+          if ! getent hosts "$DOMAIN" >/dev/null 2>&1; then
+            echo "❌ DNS não resolve para '$DOMAIN'."
+            exit 1
+          fi
+          echo "✅ DNS OK: $(getent hosts "$DOMAIN" | awk '{print $1}' | paste -sd, -)"
+
+          echo "🌐 Testando HTTPS/HTTP (HEAD curto)"
+          ok=0
+          for scheme in https http; do
+            if curl -fsSI --max-time "${TOUT:-8}" "$scheme://$DOMAIN/" >/dev/null 2>&1; then
+              echo "✅ $scheme OK"
+              ok=1
+              break
+            else
+              echo "⚠️ $scheme falhou"
+            fi
+          done
+          [ "$ok" -eq 1 ] || { echo "❌ Sem alcance HTTP/HTTPS. Encerrando."; exit 1; }
+
+      - name: Coletar subdomínios (passivo) a partir do domínio
+        id: subdomains
+        shell: bash
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          TOUT: ${{ inputs.timeout_sec }}
+        run: |
+          set -euo pipefail
+          UA="FindS3Links/secure-1.0 (+github-actions)"
+          SEED="artifacts/seed_urls.txt"
+          SUBS="artifacts/subdomains.txt"
+          TMP="artifacts/root.html"
+
+          echo "https://$DOMAIN/" > "$SEED"
+          echo "http://$DOMAIN/" >> "$SEED"
+
+          # Baixa a página raiz (https preferencial)
+          curl -fsSL -A "$UA" --max-time "${TOUT:-8}" "https://$DOMAIN/" -o "$TMP" || \
+          curl -fsSL -A "$UA" --max-time "${TOUT:-8}" "http://$DOMAIN/" -o "$TMP" || true
+
+          # Extrai URLs absolutas referenciadas
+          grep -Eoi 'https?://[^"'\'' )]+' "$TMP" | sort -u > artifacts/root_urls.txt || true
+
+          # Extrai subdomínios (host termina com .DOMAIN), exclui o próprio domínio raiz
+          awk -F/ '{print $3}' artifacts/root_urls.txt \
+            | awk -v d=".$DOMAIN" 'tolower($0) ~ tolower(d)$ {print tolower($0)}' \
+            | grep -Ev "^${DOMAIN}$" \
+            | sort -u > "$SUBS" || true
+
+          echo "🔎 Subdomínios encontrados (passivo):"
+          if [ -s "$SUBS" ]; then
+            sed -n '1,200p' "$SUBS"
+          else
+            echo "(nenhum)"
+          fi
+
+      - name: Crawl domínio e subdomínios (mesmo host) e extrair S3
         id: crawl
         shell: bash
         env:
-          SUBDOMAIN: ${{ inputs.subdomain }}
+          DOMAIN: ${{ inputs.domain }}
           MAXP: ${{ inputs.max_pages }}
           TOUT: ${{ inputs.timeout_sec }}
         run: |
           set -euo pipefail
-          UA="FindS3Links/1.2 (+github-actions)"
-          HOST="$SUBDOMAIN"
-          CAND="artifacts/s3_candidates.txt"
+          UA="FindS3Links/secure-1.0 (+github-actions)"
           VIS="artifacts/visited.txt"
           QUE="artifacts/queue.txt"
-          MAX="$MAXP"
-          T="$TOUT"
+          CAND="artifacts/s3_candidates.txt"
+          MAX="${MAXP:-10}"
+          T="${TOUT:-8}"
 
-          # seeds http/https
-          echo "https://$HOST/" > "$QUE"
-          echo "http://$HOST/" >> "$QUE"
+          # seeds para o domínio principal
+          echo "https://$DOMAIN/" > "$QUE"
+          echo "http://$DOMAIN/" >> "$QUE"
+
+          # seeds para subdomínios
+          if [ -s artifacts/subdomains.txt ]; then
+            while IFS= read -r h; do
+              [ -z "$h" ] && continue
+              echo "https://$h/" >> "$QUE"
+              echo "http://$h/" >> "$QUE"
+            done < artifacts/subdomains.txt
+          fi
 
           pages=0
           while IFS= read -r url || [ -n "${url:-}" ]; do
             [ -z "$url" ] && continue
-            # dedup visita
+            # dedup visitas
             if grep -qxF "$url" "$VIS" 2>/dev/null; then continue; fi
             echo "$url" >> "$VIS"
 
-            # baixa página
             tmp="artifacts/$(echo "$url" | tr '/:' '__').html"
             curl -fsSL -A "$UA" --max-time "$T" "$url" -o "$tmp" || continue
 
-            # extrai links absolutos
+            # Extrai links absolutos
             grep -Eoi 'https?://[^"'\'' )]+' "$tmp" | sort -u > "$tmp.links" || true
 
-            # empilha links do MESMO HOST (BFS simples)
-            awk -F/ -v h="$HOST" '$3==h {print $0}' "$tmp.links" \
+            # Empilha somente links do MESMO HOST (não segue externos); ignora extensões binárias
+            host=$(printf '%s' "$url" | awk -F/ '{print $3}')
+            awk -F/ -v h="$host" '$3==h {print $0}' "$tmp.links" \
               | sed -E 's/[#?].*$//' \
-              | grep -Ev '\.(png|jpe?g|gif|svg|ico|css|js|pdf|zip|gz|tgz|bz2|7z|mp4|mp3)$' \
+              | grep -Ev '\.(png|jpe?g|gif|svg|ico|css|pdf|zip|gz|tgz|bz2|7z|mp4|mp3)$' \
               | while read -r same; do
                   grep -qxF "$same" "$VIS" 2>/dev/null || grep -qxF "$same" "$QUE" 2>/dev/null || echo "$same" >> "$QUE"
                 done
 
-            # extrai possíveis links S3 dessa página
+            # Extrai possíveis links S3 da página
             grep -Eoi '(https?://[^"'\'' ]*\.s3[^"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
             grep -Eoi '(https?://s3[^/"'\'' ]*\.amazonaws\.com/[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
+            grep -Eoi '(https?://[^/"'\'' ]*\.s3-website[^/"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
+            grep -Eoi '(https?://[^/"'\'' ]*\.s3\.dualstack\.[^/"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
+
+            # Baixa e inspeciona JS do mesmo host (não segue JS no crawl, só lê para achar S3)
+            awk -F/ -v h="$host" '$3==h {print $0}' "$tmp.links" \
+              | grep -E '\.js($|\?)' \
+              | sed -E 's/[#].*$//' \
+              | while read -r jsu; do
+                  jstmp="artifacts/$(echo "$jsu" | tr '/:' '__').js"
+                  curl -fsSL -A "$UA" --max-time "$T" "$jsu" -o "$jstmp" || continue
+                  grep -Eoi '(https?://[^"'\'' ]*\.s3[^"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$jstmp" | sort -u >> "$CAND" || true
+                  grep -Eoi '(https?://s3[^/"'\'' ]*\.amazonaws\.com/[^"'\'' ]*)' "$jstmp" | sort -u >> "$CAND" || true
+                  grep -Eoi '(https?://[^/"'\'' ]*\.s3-website[^/"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$jstmp" | sort -u >> "$CAND" || true
+                done
 
             pages=$((pages+1))
             [ "$pages" -ge "$MAX" ] && break
           done < <(cat "$QUE")
 
-          # únicos
-          sort -u -o "$CAND" "$CAND"
+          # Normaliza candidatos (remove query/fragment, barras duplicadas) e dedup
+          if [ -s "$CAND" ]; then
+            sed -E 's/[#?].*$//' "$CAND" \
+              | sed -E 's#://+#://#' \
+              | sed -E 's#/{2,}#/#g' \
+              | sort -u > "${CAND}.norm"
+            mv "${CAND}.norm" "$CAND"
+          fi
 
-          echo "Subdomínio alvo: $HOST"
-          echo "Páginas visitadas: $pages"
-          echo "Links S3 candidatos:"
-          sed -n '1,200p' "$CAND" || echo "(nenhum)"
+          echo "📄 Páginas visitadas: $pages"
+          echo "🧩 Subdomínios salvos em artifacts/subdomains.txt"
+          echo "🪣 Candidatos S3 salvos em artifacts/s3_candidates.txt"
 
-      - name: Testar links S3 e resumir
+      - name: Testar links S3 (paralelo) e resumir
         id: test
         shell: bash
         env:
@@ -108,37 +214,34 @@ jobs:
           CAND="artifacts/s3_candidates.txt"
           RES="artifacts/results.json"
           FOUND="artifacts/s3_found.txt"
-          T="$TOUT"
+          T="${TOUT:-8}"
+          : > "$FOUND"
 
-          RESULTS=()
-          FOUND_URL=""
+          probe_one() {
+            link="$1"
+            code="$(curl -s -I -L --max-time "$T" "$link" | awk '/^HTTP/{print $2}' | tail -n1)"
+            if [ -z "$code" ] || [ "$code" = "000" ]; then
+              if curl -s -L --max-time "$T" -o /tmp/_s3.bin "$link"; then
+                [ -s /tmp/_s3.bin ] && code="200"
+              fi
+            fi
+            jq -n --arg url "$link" --arg code "${code:-}" '{url:$url, http_code:$code}'
+          }
 
           if [ -s "$CAND" ]; then
-            while IFS= read -r link; do
-              [ -z "$link" ] && continue
-              code=$(curl -s -I -L --max-time "$T" "$link" | awk '/^HTTP/{print $2}' | tail -n1)
-              # fallback GET: se baixou e tem conteúdo, assume 200
-              if [ -z "$code" ] || [ "$code" = "000" ]; then
-                if curl -s -L --max-time "$T" -o /tmp/_s3.bin "$link"; then
-                  [ -s /tmp/_s3.bin ] && code="200"
-                fi
-              fi
-              entry=$(jq -n --arg url "$link" --arg code "${code:-}" '{url:$url, http_code:$code}')
-              RESULTS+=("$entry")
-              if [ "$code" = "200" ] && [ -z "$FOUND_URL" ]; then
-                FOUND_URL="$link"
-              fi
-            done < "$CAND"
+            mapfile -t JSONS < <(xargs -I{} -P 8 bash -c 'probe_one "$@"' _ {} < "$CAND")
+            printf '%s\n' "${JSONS[@]}" | jq -s '.' > "$RES"
+            jq -r '.[] | select(.http_code=="200") | .url' "$RES" | head -n1 > "$FOUND" || true
+          else
+            echo "[]" > "$RES"
           fi
-
-          printf '%s\n' "${RESULTS[@]:-}" | jq -s '.' > "$RES"
 
           echo
           echo "========= S3 Discovery Summary ========="
-          if [ -n "$FOUND_URL" ]; then
+          if [ -s "$FOUND" ]; then
             echo "✅ Bucket público encontrado:"
-            echo "$FOUND_URL" | tee "$FOUND"
-            echo "s3_url=$FOUND_URL" >> "$GITHUB_OUTPUT"
+            cat "$FOUND"
+            echo "s3_url=$(cat "$FOUND")" >> "$GITHUB_OUTPUT"
           else
             echo "❌ Nenhum bucket público encontrado."
             echo "s3_url=" >> "$GITHUB_OUTPUT"
@@ -148,5 +251,5 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: s3-scan-results
+          name: domain-subdomains-s3-results
           path: artifacts/

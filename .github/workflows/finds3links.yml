@@ -1,0 +1,197 @@
+name: Find Links S3 Bucket URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      dev_server_url:
+        description: "URL do dev server (ex.: http://dev-server ou https://app.example)"
+        required: true
+        default: "http://dev-server"
+      org_hint:
+        description: "Hint da organização (ex.: cwl-metatech)"
+        required: true
+        default: "cwl-metatech"
+      object_name:
+        description: "Nome do objeto a testar no bucket (ex.: prod-data.txt)"
+        required: false
+        default: "prod-data.txt"
+      aws_region:
+        description: "Região AWS para formatos (ex.: us-east-1)"
+        required: false
+        default: "us-east-1"
+      quiet:
+        description: "Se true, minimiza saídas verbosas (default false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  find-s3:
+    runs-on: ubuntu-latest
+    outputs:
+      s3_url: ${{ steps.run-script.outputs.s3_url }}
+    steps:
+      - name: Checkout repo (needed to persist files)
+        uses: actions/checkout@v4
+
+      - name: Prep environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq || true
+          mkdir -p artifacts
+          echo "[]" > artifacts/results.json
+          : > artifacts/candidates.txt
+          {
+            echo "# S3 Bucket Discovery Report"
+            echo
+          } > artifacts/flags_report.md
+
+      - name: Run S3 discovery script
+        id: run-script
+        shell: bash
+        env:
+          DEV_URL: ${{ inputs.dev_server_url }}
+          ORG_HINT: ${{ inputs.org_hint }}
+          OBJ_NAME: ${{ inputs.object_name }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          QUIET: ${{ inputs.quiet }}
+        run: |
+          set -euxo pipefail
+
+          UA="S3Discovery/1.0 (+github-actions)"
+          OUTDIR=artifacts
+          HTML="$OUTDIR/dev_page.html"
+          CAND="$OUTDIR/candidates.txt"
+          RES="$OUTDIR/results.json"
+          REPORT="$OUTDIR/flags_report.md"
+
+          {
+            echo "## Parameters"
+            echo "- dev_server_url: $DEV_URL"
+            echo "- org_hint: $ORG_HINT"
+            echo "- object_name: $OBJ_NAME"
+            echo "- aws_region: $AWS_REGION"
+            echo
+          } >> "$REPORT"
+
+          # 1) fetch page
+          echo "[*] Fetching $DEV_URL ..."
+          curl -fsSL -A "$UA" "$DEV_URL" -o "$HTML" || { echo "warn: could not fetch $DEV_URL" >> "$REPORT"; true; }
+
+          # 2) extract explicit S3 links from HTML (various patterns)
+          echo "[*] Extracting explicit S3 links from HTML..."
+          # host-style, path-style and website endpoints
+          grep -Eoi '(https?://[^"'\'' ]*\.s3[^"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$HTML" | sort -u > "$CAND" || true
+          grep -Eoi '(https?://s3[^/"'\'' ]*\.amazonaws\.com/[^"'\'' ]*)' "$HTML" | sort -u >> "$CAND" || true
+          grep -Eoi '(https?://[^/"'\'' ]*\.s3-website[^/"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$HTML" | sort -u >> "$CAND" || true
+
+          # 3) add heuristic candidates based on org_hint
+          echo "[*] Adding heuristic candidates from org hint..."
+          {
+            echo "https://${ORG_HINT}.s3.amazonaws.com/"
+            echo "https://s3.amazonaws.com/${ORG_HINT}/"
+            echo "https://${ORG_HINT}.s3.${AWS_REGION}.amazonaws.com/"
+            echo "https://s3.${AWS_REGION}.amazonaws.com/${ORG_HINT}/"
+            echo "https://${ORG_HINT}.s3-website.${AWS_REGION}.amazonaws.com/"
+          } >> "$CAND"
+
+          # 4) lightweight additional heuristics (common suffix/prefix)
+          for suf in "" "-prod" "-stage" "-staging" "-data" "-assets" "-static" "-public" "-cdn"; do
+            echo "https://${ORG_HINT}${suf}.s3.amazonaws.com/" >> "$CAND"
+            echo "https://${ORG_HINT}${suf}.s3.${AWS_REGION}.amazonaws.com/" >> "$CAND"
+            echo "https://${ORG_HINT}${suf}.s3-website.${AWS_REGION}.amazonaws.com/" >> "$CAND"
+          done
+          for pre in "cdn-" "static-" "assets-" "public-"; do
+            echo "https://${pre}${ORG_HINT}.s3.amazonaws.com/" >> "$CAND"
+            echo "https://${pre}${ORG_HINT}.s3.${AWS_REGION}.amazonaws.com/" >> "$CAND"
+            echo "https://${pre}${ORG_HINT}.s3-website.${AWS_REGION}.amazonaws.com/" >> "$CAND"
+          done
+
+          # ensure unique
+          sort -u -o "$CAND" "$CAND"
+
+          echo "## Candidate S3 URLs (top 200 shown)" >> "$REPORT"
+          sed -n '1,200p' "$CAND" | sed 's/^/- /' >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # 5) probe each candidate: check HEAD for object / index
+          echo "Probing candidates for object: $OBJ_NAME" >> "$REPORT"
+          RESULTS=()
+          FOUND_URL=""
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            base="${url%/}"
+            probe="${base}/${OBJ_NAME}"
+
+            # try HEAD (follow redirects), fall back to GET if needed
+            code=""
+            if curl -sS -I -L --max-time 8 -A "$UA" "$probe" -o /tmp/head_out.txt; then
+              code=$(grep -i '^HTTP/' /tmp/head_out.txt | awk '{print $2}' | tail -n1 || true)
+            fi
+            if [ -z "$code" ] || [ "$code" = "000" ]; then
+              if curl -sS -L --max-time 8 -A "$UA" -o /tmp/get_out.bin "$probe"; then
+                if [ -s /tmp/get_out.bin ]; then
+                  code="200"
+                fi
+              fi
+            fi
+
+            entry=$(jq -n --arg url "$url" --arg probe "$probe" --arg code "${code:-}" '{url:$url,probe:$probe,http_code:$code}')
+            RESULTS+=("$entry")
+
+            if [ "$code" = "200" ] && [ -z "$FOUND_URL" ]; then
+              FOUND_URL="$probe"
+            fi
+
+            if [ "${QUIET,,}" != "true" ]; then
+              echo "probe: $probe -> ${code:-N/A}"
+            fi
+          done < "$CAND"
+
+          printf '%s\n' "${RESULTS[@]}" | jq -s '.' > "$RES"
+
+          {
+            echo "### Probe results (summary)"
+            jq -r '.[] | "- \(.probe) => \(.http_code)"' "$RES" || true
+            echo
+          } >> "$REPORT"
+
+          if [ -n "$FOUND_URL" ]; then
+            echo "### FOUND candidate (first 200 OK):" >> "$REPORT"
+            echo "- $FOUND_URL" >> "$REPORT"
+            echo "$FOUND_URL" > "$OUTDIR/s3_found.txt"
+            echo "s3_url=$FOUND_URL" >> "$GITHUB_OUTPUT"
+          else
+            echo "### No candidate returned 200 OK for $OBJ_NAME" >> "$REPORT"
+            : > "$OUTDIR/s3_found.txt"
+            echo "s3_url=" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Report and results saved to artifacts/"
+          ls -lah artifacts || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-discovery-results
+          path: artifacts/
+
+      - name: Print concise result
+        if: always()
+        shell: bash
+        run: |
+          echo
+          echo "========= S3 Discovery Summary ========="
+          FOUND_FILE="artifacts/s3_found.txt"
+          if [ -s "$FOUND_FILE" ]; then
+            echo "✅ Bucket público encontrado:"
+            cat "$FOUND_FILE"
+          else
+            echo "❌ Nenhum bucket público encontrado."
+          fi
+          echo "----------------------------------------"
+          echo "s3_url output: ${{ steps.run-script.outputs.s3_url }}"

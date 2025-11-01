@@ -1,10 +1,10 @@
-name: Find S3 Links
+name: Find S3 Links (with subdomain passivo)
 
 on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: "URL do site a ser verificado (ex.: https://app.exemplo.com)"
+        description: "URL de partida (ex.: https://app.exemplo.com)"
         required: true
         default: "https://app.exemplo.com"
 
@@ -22,19 +22,126 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y curl jq || true
           mkdir -p artifacts
-          echo "" > artifacts/s3_found.txt
+          : > artifacts/page.html
+          : > artifacts/subdomains.txt
+          : > artifacts/s3_candidates.txt
           echo "[]" > artifacts/results.json
+          : > artifacts/s3_found.txt
 
-      - name: Buscar e testar links S3
-        id: run
+      - name: Subdomínios (passivo) + busca de links S3
+        id: crawl
         shell: bash
         env:
-          URL: ${{ inputs.target_url }}
+          START_URL: ${{ inputs.target_url }}
         run: |
           set -euo pipefail
-          echo "Verificando: $URL"
+
+          UA="FindS3Links/1.1 (+github-actions)"
           HTML="artifacts/page.html"
-          CAND="artifacts/candidates.txt"
+          SUBS="artifacts/subdomains.txt"
+          CAND="artifacts/s3_candidates.txt"
+
+          echo "Verificando: $START_URL"
+
+          # ---- helpers ----
+          get_host () { awk -F/ '{print $3}'; }
+          get_base () {  # melhor esforço (eTLD+1 simples; não cobre .co.uk)
+            awk -F. '{ if (NF>1) {print $(NF-1)"."$NF} else {print $0} }'
+          }
+
+          ROOT_HOST="$(printf '%s' "$START_URL" | get_host)"
+          BASE_DOMAIN="$(printf '%s' "$ROOT_HOST" | get_base)"
+          echo "Dominio base (heurístico): $BASE_DOMAIN"
+
+          fetch_and_extract() {
+            local url="$1" out_html="$2"
+            curl -fsSL -A "$UA" "$url" -o "$out_html" || return 0
+            # 1) extrair URLs completas
+            grep -Eoi 'https?://[^"'\'' >)]+' "$out_html" | sort -u
+          }
+
+          # ---- 1) Página inicial ----
+          fetch_and_extract "$START_URL" "$HTML" > artifacts/urls_initial.txt || true
+
+          # subdomínios passivos a partir dos links encontrados
+          awk -F/ '{print $3}' artifacts/urls_initial.txt \
+            | grep -E ".+\\.${BASE_DOMAIN}$" \
+            | sort -u > "$SUBS" || true
+
+          # garantir inclusão do host raiz
+          { echo "$ROOT_HOST"; cat "$SUBS"; } | sort -u > "$SUBS.tmp" && mv "$SUBS.tmp" "$SUBS"
+
+          echo "Subdomínios (passivo):"
+          sed -n '1,200p' "$SUBS" || echo "(nenhum)"
+
+          # extrair possíveis links S3 da página inicial
+          grep -Eoi '(https?://[^"'\'' ]*\.s3[^"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$HTML" | sort -u >> "$CAND" || true
+          grep -Eoi '(https?://s3[^/"'\'' ]*\.amazonaws\.com/[^"'\'' ]*)' "$HTML" | sort -u >> "$CAND" || true
+
+          # ---- 2) Visitar páginas dos subdomínios (http/https) e extrair links S3 ----
+          while IFS= read -r host; do
+            [ -z "$host" ] && continue
+            for scheme in https http; do
+              url="${scheme}://${host}/"
+              tmp="artifacts/${host//./_}.html"
+              curl -fsSL -A "$UA" --max-time 8 "$url" -o "$tmp" || continue
+              grep -Eoi '(https?://[^"'\'' ]*\.s3[^"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
+              grep -Eoi '(https?://s3[^/"'\'' ]*\.amazonaws\.com/[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
+            done
+          done < "$SUBS"
+
+          # candidatos únicos
+          sort -u -o "$CAND" "$CAND"
+
+          echo "Possíveis links S3 encontrados:"
+          sed -n '1,200p' "$CAND" || echo "(nenhum link S3 encontrado)"
+
+      - name: Testar links S3 e resumir
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          CAND="artifacts/s3_candidates.txt"
+          RES="artifacts/results.json"
+          FOUND="artifacts/s3_found.txt"
+
+          RESULTS=()
+          FOUND_URL=""
+          if [ -s "$CAND" ]; then
+            while IFS= read -r link; do
+              [ -z "$link" ] && continue
+              code=$(curl -s -I -L --max-time 8 "$link" | awk '/^HTTP/{print $2}' | tail -n1)
+              # fallback GET simples
+              if [ -z "$code" ] || [ "$code" = "000" ]; then
+                if curl -s -L --max-time 8 -o /tmp/_s3.bin "$link"; then
+                  [ -s /tmp/_s3.bin ] && code="200"
+                fi
+              fi
+              entry=$(jq -n --arg url "$link" --arg code "${code:-}" '{url:$url, http_code:$code}')
+              RESULTS+=("$entry")
+              if [ "$code" = "200" ] && [ -z "$FOUND_URL" ]; then
+                FOUND_URL="$link"
+              fi
+            done < "$CAND"
+          fi
+
+          printf '%s\n' "${RESULTS[@]:-}" | jq -s '.' > "$RES"
+
+          echo
+          echo "========= S3 Discovery Summary ========="
+          if [ -n "$FOUND_URL" ]; then
+            echo "✅ Bucket público encontrado:"
+            echo "$FOUND_URL" | tee "$FOUND"
+          else
+            echo "❌ Nenhum bucket público encontrado."
+          fi
+          echo "----------------------------------------"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-scan-results
+          path: artifacts/          CAND="artifacts/candidates.txt"
           RES="artifacts/results.json"
           FOUND="artifacts/s3_found.txt"
 

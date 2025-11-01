@@ -8,13 +8,13 @@ on:
         required: true
         default: "example.com"
       max_pages:
-        description: "Máximo de páginas por host (crawl controlado)"
+        description: "Máx. páginas por host (crawl controlado)"
         required: false
         default: "10"
       timeout_sec:
         description: "Timeout (s) por requisição HTTP"
         required: false
-        default: "8"
+        default: "20"
 
 permissions:
   contents: read
@@ -33,6 +33,7 @@ jobs:
           sudo apt-get install -y curl jq || true
           mkdir -p artifacts
           : > artifacts/seed_urls.txt
+          : > artifacts/root_urls.txt
           : > artifacts/subdomains.txt
           : > artifacts/visited.txt
           : > artifacts/queue.txt
@@ -40,14 +41,13 @@ jobs:
           : > artifacts/s3_found.txt
           echo "[]" > artifacts/results.json
 
-      - name: Validar formato do domínio (seguro)
+      - name: Validar formato do domínio
         id: validate
         shell: bash
         env:
           DOMAIN: ${{ inputs.domain }}
         run: |
           set -euo pipefail
-          # Permite letras, números, hífen e pontos. Tamanho máx. 253. Não permite http/https, barras ou espaços.
           if ! [[ "$DOMAIN" =~ ^([a-z0-9]([-a-z0-9]*[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
             echo "❌ Domínio inválido: '$DOMAIN'. Use algo como 'example.com'."
             exit 1
@@ -72,7 +72,7 @@ jobs:
           echo "🌐 Testando HTTPS/HTTP (HEAD curto)"
           ok=0
           for scheme in https http; do
-            if curl -fsSI --max-time "${TOUT:-8}" "$scheme://$DOMAIN/" >/dev/null 2>&1; then
+            if curl -fsSI --max-time "${TOUT:-20}" "$scheme://$DOMAIN/" >/dev/null 2>&1; then
               echo "✅ $scheme OK"
               ok=1
               break
@@ -90,33 +90,35 @@ jobs:
           TOUT: ${{ inputs.timeout_sec }}
         run: |
           set -euo pipefail
-          UA="FindS3Links/secure-1.0 (+github-actions)"
+          UA="FindS3Links/secure-1.1 (+github-actions)"
           SEED="artifacts/seed_urls.txt"
           SUBS="artifacts/subdomains.txt"
-          TMP="artifacts/root.html"
+          ROOT_HTML="artifacts/root.html"
 
           echo "https://$DOMAIN/" > "$SEED"
           echo "http://$DOMAIN/" >> "$SEED"
 
           # Baixa a página raiz (https preferencial)
-          curl -fsSL -A "$UA" --max-time "${TOUT:-8}" "https://$DOMAIN/" -o "$TMP" || \
-          curl -fsSL -A "$UA" --max-time "${TOUT:-8}" "http://$DOMAIN/" -o "$TMP" || true
+          curl -fsSL -A "$UA" --max-time "${TOUT:-20}" "https://$DOMAIN/" -o "$ROOT_HTML" || \
+          curl -fsSL -A "$UA" --max-time "${TOUT:-20}" "http://$DOMAIN/" -o "$ROOT_HTML" || true
 
           # Extrai URLs absolutas referenciadas
-          grep -Eoi 'https?://[^"'\'' )]+' "$TMP" | sort -u > artifacts/root_urls.txt || true
+          grep -Eoi 'https?://[^"'\'' )]+' "$ROOT_HTML" | sort -u > artifacts/root_urls.txt || true
 
-          # Extrai subdomínios (host termina com .DOMAIN), exclui o próprio domínio raiz
+          # Extrai subdomínios que terminam em .DOMAIN (lowercase); corrige âncora $ no awk
           awk -F/ '{print $3}' artifacts/root_urls.txt \
-            | awk -v d=".$DOMAIN" 'tolower($0) ~ tolower(d)$ {print tolower($0)}' \
+            | awk -v d=".$DOMAIN" 'tolower($0) ~ tolower(d)"$" {print tolower($0)}' \
             | grep -Ev "^${DOMAIN}$" \
             | sort -u > "$SUBS" || true
 
-          echo "🔎 Subdomínios encontrados (passivo):"
-          if [ -s "$SUBS" ]; then
-            sed -n '1,200p' "$SUBS"
-          else
-            echo "(nenhum)"
-          fi
+          # Fallback leve de subdomínios comuns (mantém passivo e seguro)
+          for prefix in www app api cdn assets static; do
+            echo "${prefix}.${DOMAIN}"
+          done | sort -u >> "$SUBS" || true
+          sort -u -o "$SUBS" "$SUBS"
+
+          echo "🔎 Subdomínios (passivo + fallback leve):"
+          if [ -s "$SUBS" ]; then sed -n '1,200p' "$SUBS"; else echo "(nenhum)"; fi
 
       - name: Crawl domínio e subdomínios (mesmo host) e extrair S3
         id: crawl
@@ -127,18 +129,18 @@ jobs:
           TOUT: ${{ inputs.timeout_sec }}
         run: |
           set -euo pipefail
-          UA="FindS3Links/secure-1.0 (+github-actions)"
+          UA="FindS3Links/secure-1.1 (+github-actions)"
           VIS="artifacts/visited.txt"
           QUE="artifacts/queue.txt"
           CAND="artifacts/s3_candidates.txt"
           MAX="${MAXP:-10}"
-          T="${TOUT:-8}"
+          T="${TOUT:-20}"
 
-          # seeds para o domínio principal
+          # seeds: domínio principal
           echo "https://$DOMAIN/" > "$QUE"
           echo "http://$DOMAIN/" >> "$QUE"
 
-          # seeds para subdomínios
+          # seeds: subdomínios
           if [ -s artifacts/subdomains.txt ]; then
             while IFS= read -r h; do
               [ -z "$h" ] && continue
@@ -150,7 +152,7 @@ jobs:
           pages=0
           while IFS= read -r url || [ -n "${url:-}" ]; do
             [ -z "$url" ] && continue
-            # dedup visitas
+            # dedup visita
             if grep -qxF "$url" "$VIS" 2>/dev/null; then continue; fi
             echo "$url" >> "$VIS"
 
@@ -160,7 +162,7 @@ jobs:
             # Extrai links absolutos
             grep -Eoi 'https?://[^"'\'' )]+' "$tmp" | sort -u > "$tmp.links" || true
 
-            # Empilha somente links do MESMO HOST (não segue externos); ignora extensões binárias
+            # Enfileira somente links do MESMO HOST (ignora binários)
             host=$(printf '%s' "$url" | awk -F/ '{print $3}')
             awk -F/ -v h="$host" '$3==h {print $0}' "$tmp.links" \
               | sed -E 's/[#?].*$//' \
@@ -169,13 +171,13 @@ jobs:
                   grep -qxF "$same" "$VIS" 2>/dev/null || grep -qxF "$same" "$QUE" 2>/dev/null || echo "$same" >> "$QUE"
                 done
 
-            # Extrai possíveis links S3 da página
+            # Extrai possíveis links S3 da página (inclui s3-website e dualstack)
             grep -Eoi '(https?://[^"'\'' ]*\.s3[^"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
             grep -Eoi '(https?://s3[^/"'\'' ]*\.amazonaws\.com/[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
             grep -Eoi '(https?://[^/"'\'' ]*\.s3-website[^/"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
             grep -Eoi '(https?://[^/"'\'' ]*\.s3\.dualstack\.[^/"'\'' ]*\.amazonaws\.com[^"'\'' ]*)' "$tmp" | sort -u >> "$CAND" || true
 
-            # Baixa e inspeciona JS do mesmo host (não segue JS no crawl, só lê para achar S3)
+            # Baixa e inspeciona JS do mesmo host apenas para achar S3 (não segue JS no crawl)
             awk -F/ -v h="$host" '$3==h {print $0}' "$tmp.links" \
               | grep -E '\.js($|\?)' \
               | sed -E 's/[#].*$//' \
@@ -191,7 +193,7 @@ jobs:
             [ "$pages" -ge "$MAX" ] && break
           done < <(cat "$QUE")
 
-          # Normaliza candidatos (remove query/fragment, barras duplicadas) e dedup
+          # Normaliza candidatos e dedup
           if [ -s "$CAND" ]; then
             sed -E 's/[#?].*$//' "$CAND" \
               | sed -E 's#://+#://#' \
@@ -214,7 +216,7 @@ jobs:
           CAND="artifacts/s3_candidates.txt"
           RES="artifacts/results.json"
           FOUND="artifacts/s3_found.txt"
-          T="${TOUT:-8}"
+          T="${TOUT:-20}"
           : > "$FOUND"
 
           probe_one() {
@@ -229,7 +231,7 @@ jobs:
           }
 
           if [ -s "$CAND" ]; then
-            mapfile -t JSONS < <(xargs -I{} -P 8 bash -c 'probe_one "$@"' _ {} < "$CAND")
+            mapfile -t JSONS < <(cat "$CAND" | xargs -I{} -P 8 bash -c 'probe_one "$@"' _ {})
             printf '%s\n' "${JSONS[@]}" | jq -s '.' > "$RES"
             jq -r '.[] | select(.http_code=="200") | .url' "$RES" | head -n1 > "$FOUND" || true
           else
@@ -251,5 +253,5 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: domain-subdomains-s3-results
+          name: finds3links-results
           path: artifacts/

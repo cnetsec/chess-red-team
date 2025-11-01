@@ -141,44 +141,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s3-scan-results
-          path: artifacts/          CAND="artifacts/candidates.txt"
-          RES="artifacts/results.json"
-          FOUND="artifacts/s3_found.txt"
-
-          # baixar página
-          curl -fsSL "$URL" -o "$HTML" || { echo "⚠️ Não foi possível acessar $URL"; exit 0; }
-
-          # extrair possíveis links S3
-          grep -Eoi '(https?://[^"'\'' ]+\.s3[^"'\'' ]+\.amazonaws\.com[^"'\'' ]*)' "$HTML" | sort -u > "$CAND" || true
-
-          echo "Possíveis links S3 encontrados:"
-          cat "$CAND" || echo "(nenhum link encontrado)"
-          echo ""
-
-          RESULTS=()
-          FOUND_URL=""
-          while IFS= read -r link; do
-            [ -z "$link" ] && continue
-            code=$(curl -s -I -L --max-time 8 "$link" | awk '/^HTTP/{print $2}' | tail -n1)
-            entry=$(jq -n --arg url "$link" --arg code "$code" '{url:$url, http_code:$code}')
-            RESULTS+=("$entry")
-
-            if [ "$code" = "200" ] && [ -z "$FOUND_URL" ]; then
-              FOUND_URL="$link"
-            fi
-          done < "$CAND"
-
-          printf '%s\n' "${RESULTS[@]}" | jq -s '.' > "$RES"
-
-          if [ -n "$FOUND_URL" ]; then
-            echo "✅ Bucket público encontrado:"
-            echo "$FOUND_URL" | tee "$FOUND"
-          else
-            echo "❌ Nenhum bucket público encontrado."
-          fi
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: s3-scan-results
           path: artifacts/
